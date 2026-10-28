@@ -6,6 +6,10 @@ const MANIFEST_BASE = "https://raw.githubusercontent.com/TrueSightDAO/farm_media
 const S3 = "https://s3.amazonaws.com/media.agroverse.shop";
 const ytThumb = (id) => `https://img.youtube.com/vi/${id}/hqdefault.jpg`;
 
+const PREVIEWS_INDEX = `${S3}/previews.json`;
+const PREVIEW_STEMS = new Map(); // ns -> Set(stem) of previews that actually exist
+const RAW_FILES = new Map(); // ns -> { filename: ext } straight from S3
+
 const TYPE_ORDER = ["farm", "facility", "event", "partner", "program", "unsorted"];
 const ITEMS = [];
 const FILTER = { types: new Set(), nss: new Set(), q: "" };
@@ -32,6 +36,14 @@ function dateOf(it) {
   return isNaN(d.getTime()) ? null : d;
 }
 
+/* A preview may legitimately be absent (manifest filename != S3 key). Trust the
+ * index when we have it; only fall back to optimistic derivation if it failed. */
+function hasPreview(ns, stem) {
+  const set = PREVIEW_STEMS.get(ns);
+  if (!set) return true;
+  return set.has(stem);
+}
+
 function normalize(it, ns, id) {
   const file = it.file || "";
   const stem = file.replace(/\.[^.]+$/, "");
@@ -45,7 +57,7 @@ function normalize(it, ns, id) {
     file,
     stem,
     isVideo,
-    preview: hasFile ? `${S3}/previews/${ns}/${stem}.jpg` : null,
+    preview: hasFile && hasPreview(ns, stem) ? `${S3}/previews/${ns}/${stem}.jpg` : null,
     rawUrl: hasFile && isVideo ? `${S3}/raw/${ns}/${encodeURIComponent(file)}` : null,
     yt: it.yt_id || null,
     lat: Number.isFinite(it.latitude) ? it.latitude : null,
@@ -83,6 +95,8 @@ async function loadAll() {
   }
   files = [...new Set(files)];
 
+  await loadPreviewIndex();
+
   await Promise.all(
     files.map(async (f) => {
       try {
@@ -96,6 +110,41 @@ async function loadAll() {
       }
     })
   );
+
+  expandFromRawIndex();
+}
+
+/* Pull the authoritative preview/raw index: 31 namespaces, 2,374 stems.
+ * This is what makes a preview URL honest rather than a guess. */
+async function loadPreviewIndex() {
+  try {
+    const r = await fetch(PREVIEWS_INDEX, { cache: "no-store" });
+    if (!r.ok) return;
+    const d = await r.json();
+    Object.entries(d.previews || {}).forEach(([ns, stems]) => {
+      if (Array.isArray(stems)) PREVIEW_STEMS.set(ns, new Set(stems));
+    });
+    Object.entries(d.raw || {}).forEach(([ns, files]) => {
+      if (files && typeof files === "object") RAW_FILES.set(ns, files);
+    });
+  } catch (e) {
+    console.warn("previews.json unavailable; deriving preview URLs optimistically", e);
+  }
+}
+
+/* Manifests describe only 22 of 31 namespaces. Surface every raw file that no
+ * manifest mentions, so event/facility material is browsable instead of invisible.
+ * These keep honest metadata: no GPS, no date -> shown as undated, not mis-mapped. */
+function expandFromRawIndex() {
+  const seen = new Set(ITEMS.map((it) => `${it.ns}/${it.file}`));
+  RAW_FILES.forEach((files, ns) => {
+    Object.keys(files).forEach((file) => {
+      const key = `${ns}/${file}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      ITEMS.push(normalize({ file }, ns, ITEMS.length));
+    });
+  });
 }
 
 /* ---------- filtering ---------- */
