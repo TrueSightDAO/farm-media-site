@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Media Archive — TrueSight DAO</title>
+<meta name="description" content="Every farm, facility, event and partner video and photo captured by the TrueSight DAO — mapped, dated and searchable.">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>Media Archive</h1>
+    <p>Every farm, facility, event and partner we have captured &mdash; mapped, dated, searchable.</p>
+  </div>
+  <nav class="tabs" id="tabs">
+    <button data-view="map" class="on">Map</button>
+    <button data-view="timeline">Timeline</button>
+    <button data-view="names">Names</button>
+  </nav>
+</header>
+
+<main>
+  <aside id="facets">
+    <input id="q" type="search" placeholder="Search names, transcripts&hellip;" autocomplete="off">
+    <div class="facet-block">
+      <h2>Kind</h2>
+      <div id="facet-type"></div>
+    </div>
+    <div class="facet-block">
+      <h2>Source</h2>
+      <div id="facet-ns"></div>
+    </div>
+    <button id="reset" class="ghost">Reset filters</button>
+    <p id="stats" class="stats"></p>
+  </aside>
+
+  <section id="stage">
+    <div id="loading" class="loading">Loading archive&hellip;</div>
+    <div id="view-map" class="view on"><div id="map"></div><p class="hint" id="mapcount"></p></div>
+    <div id="view-timeline" class="view"><div id="timeline"></div></div>
+    <div id="view-names" class="view"><div id="names"></div></div>
+  </section>
+</main>
+
+<div id="lightbox" class="lightbox">
+  <div class="lb-inner">
+    <button class="lb-close" id="lb-close" aria-label="Close">&times;</button>
+    <div id="lb-body"></div>
+    <p id="lb-title"></p>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
