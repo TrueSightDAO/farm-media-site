@@ -81,7 +81,9 @@ async function loadAll() {
     const r = await fetch(MANIFEST_BASE + "index.json", { cache: "no-store" });
     if (r.ok) {
       const idx = await r.json();
-      const list = Array.isArray(idx) ? idx : idx.manifests || idx.farms || [];
+      /* The published index nests its rows under `index` (array of
+       * {farm_id, manifest, updated}). Older/other shapes are kept as fallbacks. */
+      const list = Array.isArray(idx) ? idx : idx.index || idx.manifests || idx.farms || [];
       files = list
         .map((m) => (typeof m === "string" ? m : m.manifest || m.file || m.farm_id))
         .filter(Boolean)
@@ -90,12 +92,16 @@ async function loadAll() {
   } catch (e) {
     console.warn("index.json unavailable, falling back to a seed list", e);
   }
+  await loadPreviewIndex();
+
+  /* If the manifest index is unreachable, seed with every raw namespace that has
+   * one and let the S3 index fill in the rest — better than a hardcoded trio that
+   * silently drops most of the archive. */
   if (!files.length) {
-    files = ["oscar-bahia.json", "fazenda-santa-ana-bahia.json", "paulo-la-do-sitio.json"];
+    files = [...RAW_FILES.keys()].map((ns) => ns + ".json");
+    console.warn("using raw-index namespaces as manifest seeds:", files.length);
   }
   files = [...new Set(files)];
-
-  await loadPreviewIndex();
 
   await Promise.all(
     files.map(async (f) => {
@@ -112,6 +118,19 @@ async function loadAll() {
   );
 
   expandFromRawIndex();
+  sortItems();
+}
+
+/* Stable, view-agnostic order: newest first, undated last, then by ns/file.
+ * Keeps ids meaningful (ids are array indices) and the grid deterministic. */
+function sortItems() {
+  ITEMS.sort((a, b) => {
+    if (a.date && b.date) return b.date - a.date;
+    if (a.date) return -1;
+    if (b.date) return 1;
+    return a.ns.localeCompare(b.ns) || a.file.localeCompare(b.file);
+  });
+  ITEMS.forEach((it, i) => (it.id = i));
 }
 
 /* Pull the authoritative preview/raw index: 31 namespaces, 2,374 stems.
