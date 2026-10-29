@@ -44,28 +44,54 @@ function hasPreview(ns, stem) {
   return set.has(stem);
 }
 
+/* Manifest `file` values are sometimes full paths ("santa_anna_fazenda/IMG_7702.HEIC")
+ * while S3 keys are flat within a namespace. Compare on basename, or every preview
+ * 404s and the raw-index pass re-adds the same file as a duplicate clone. */
+const basename = (p) => String(p || "").split("/").pop();
+
+/* A genuine GPS fix always carries decimals. The exporter emitted an exact
+ * whole-degree placeholder ("3.0, 52.0") for all 44 santa-anna photos, which
+ * plotted them in the Indian Ocean off Somalia. Whole-degree pairs are never a
+ * real fix, so treat them as absent rather than drawing a wrong pin. */
+function gpsOf(it) {
+  const lat = Number(it.latitude);
+  const lng = Number(it.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return { lat: null, lng: null };
+  if (Number.isInteger(lat) && Number.isInteger(lng)) {
+    return { lat: null, lng: null, suspect: `${lat}, ${lng}` };
+  }
+  return { lat, lng };
+}
+
+/* Kept separate from normalize() because it.ns can be re-pointed after load by
+ * resolveNamespaces(), which changes both the preview and raw paths. */
+function applyPreview(it) {
+  it.preview =
+    it.file && hasPreview(it.ns, it.stem) ? `${S3}/previews/${it.ns}/${it.stem}.jpg` : null;
+  it.rawUrl = it.file && it.isVideo ? `${S3}/raw/${it.ns}/${encodeURIComponent(it.file)}` : null;
+  return it;
+}
+
 function normalize(it, ns, id) {
-  const file = it.file || "";
+  const file = basename(it.file || it.basename || "");
   const stem = file.replace(/\.[^.]+$/, "");
   const ext = (file.split(".").pop() || "").toLowerCase();
-  const isVideo = ["mov", "mp4", "m4v", "avi"].includes(ext);
-  const hasFile = Boolean(file);
-  return {
+  const g = gpsOf(it);
+  return applyPreview({
     id,
     ns,
     type: entityType(ns),
     file,
     stem,
-    isVideo,
-    preview: hasFile && hasPreview(ns, stem) ? `${S3}/previews/${ns}/${stem}.jpg` : null,
-    rawUrl: hasFile && isVideo ? `${S3}/raw/${ns}/${encodeURIComponent(file)}` : null,
+    isVideo: ["mov", "mp4", "m4v", "avi"].includes(ext),
     yt: it.yt_id || null,
-    lat: Number.isFinite(it.latitude) ? it.latitude : null,
-    lng: Number.isFinite(it.longitude) ? it.longitude : null,
+    lat: g.lat,
+    lng: g.lng,
+    gpsSuspect: g.suspect || null,
     date: dateOf(it),
     transcript: it.transcription || "",
     duration: it.duration_s || null,
-  };
+  });
 }
 
 const fmtDate = (d) =>
@@ -117,8 +143,58 @@ async function loadAll() {
     })
   );
 
+  resolveNamespaces();
   expandFromRawIndex();
+  pruneUnservable();
   sortItems();
+}
+
+/* Some manifests name a namespace that S3 does not have — `santa-anna-fazenda-para`
+ * vs the real `santa-anna-fazenda`. Without this, previews 404 AND the raw-index
+ * pass fails to recognise the files, so all 44 appear twice (once with the bogus
+ * coords, once with none). Re-point the namespace when most basenames agree. */
+function resolveNamespaces() {
+  if (!RAW_FILES.size) return;
+  const byNs = new Map();
+  ITEMS.forEach((it) => {
+    if (!byNs.has(it.ns)) byNs.set(it.ns, new Set());
+    byNs.get(it.ns).add(it.file);
+  });
+  byNs.forEach((files, ns) => {
+    if (RAW_FILES.has(ns)) return;
+    let best = null;
+    RAW_FILES.forEach((s3files, cand) => {
+      let hits = 0;
+      files.forEach((f) => {
+        if (f in s3files) hits++;
+      });
+      if (hits && (!best || hits > best.hits)) best = { cand, hits };
+    });
+    if (best && best.hits / files.size >= 0.5) {
+      ITEMS.forEach((it) => {
+        if (it.ns === ns) it.ns = best.cand;
+      });
+      console.info(`namespace aliased: ${ns} -> ${best.cand} (${best.hits}/${files.size} files match)`);
+    }
+  });
+  ITEMS.forEach(applyPreview);
+}
+
+/* Drop manifest rows whose file does not exist in S3 at all: they can never render,
+ * and they inflate every facet, the timeline, and the "N of M" map denominator. */
+function pruneUnservable() {
+  if (!RAW_FILES.size) return;
+  let dropped = 0;
+  for (let i = ITEMS.length - 1; i >= 0; i--) {
+    const it = ITEMS[i];
+    if (it.yt) continue;
+    const s3 = RAW_FILES.get(it.ns);
+    if (!s3 || !(it.file in s3)) {
+      ITEMS.splice(i, 1);
+      dropped++;
+    }
+  }
+  if (dropped) console.info(`pruned ${dropped} manifest row(s) with no S3 source`);
 }
 
 /* Stable, view-agnostic order: newest first, undated last, then by ns/file.
@@ -267,8 +343,10 @@ function renderMap(items) {
   });
   cluster.addLayers(markers);
   if (pts.length) map.fitBounds(pts, { padding: [28, 28], maxZoom: 9 });
+  const bad = items.filter((it) => it.gpsSuspect).length;
   document.getElementById("mapcount").textContent =
-    `${pts.length} of ${items.length} shown have GPS coordinates`;
+    `${pts.length} of ${items.length} shown have GPS coordinates` +
+    (bad ? ` \u00b7 ${bad} placeholder coord${bad === 1 ? "" : "s"} ignored` : "");
 }
 
 /* ---------- timeline ---------- */
