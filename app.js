@@ -152,7 +152,18 @@ async function loadAll() {
 /* Some manifests name a namespace that S3 does not have — `santa-anna-fazenda-para`
  * vs the real `santa-anna-fazenda`. Without this, previews 404 AND the raw-index
  * pass fails to recognise the files, so all 44 appear twice (once with the bogus
- * coords, once with none). Re-point the namespace when most basenames agree. */
+ * coords, once with none).
+ *
+ * Filename overlap alone is NOT sufficient evidence: phone cameras all emit
+ * IMG_1234.HEIC, so unrelated namespaces collide (founderhaus matched event-media
+ * 10/10; fazenda-clara-bahia matched fernando-carla 58/58). Relabelling those
+ * would mis-attribute one farm's photos to another. Require the namespace names
+ * to be lexically related AND a high filename match rate. */
+const nsKey = (s) =>
+  String(s || "")
+    .toLowerCase()
+    .replace(/^farms\//, "")
+    .replace(/[^a-z0-9]/g, "");
 function resolveNamespaces() {
   if (!RAW_FILES.size) return;
   const byNs = new Map();
@@ -162,19 +173,25 @@ function resolveNamespaces() {
   });
   byNs.forEach((files, ns) => {
     if (RAW_FILES.has(ns)) return;
+    const nk = nsKey(ns);
+    if (!nk) return;
     let best = null;
     RAW_FILES.forEach((s3files, cand) => {
+      const ck = nsKey(cand);
+      if (!ck || !(nk.includes(ck) || ck.includes(nk))) return;
       let hits = 0;
       files.forEach((f) => {
         if (f in s3files) hits++;
       });
       if (hits && (!best || hits > best.hits)) best = { cand, hits };
     });
-    if (best && best.hits / files.size >= 0.5) {
+    if (best && best.hits / files.size >= 0.75) {
       ITEMS.forEach((it) => {
         if (it.ns === ns) it.ns = best.cand;
       });
       console.info(`namespace aliased: ${ns} -> ${best.cand} (${best.hits}/${files.size} files match)`);
+    } else {
+      console.info(`namespace kept unaliased (not lexically related): ${ns}`);
     }
   });
   ITEMS.forEach(applyPreview);
