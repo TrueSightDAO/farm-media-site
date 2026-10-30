@@ -94,16 +94,19 @@ const sameKind = (a, b) => {
  * two names share no token \u2014 a lexical-only rule rejects a provable link. */
 function sourceZips(d) {
   const out = new Set();
-  const add = (v) => {
-    const str = typeof v === "string" ? v : "";
-    if (/\.zip$/i.test(str)) out.add(basename(str));
+  const walk = (v, depth) => {
+    if (depth > 4 || v == null) return;
+    if (typeof v === "string") {
+      const m = v.match(/([^\/\\]+\.zip)\b/i);
+      if (m) out.add(m[1]);
+      return;
+    }
+    if (Array.isArray(v)) return v.slice(0, 40).forEach((x) => walk(x, depth + 1));
+    if (typeof v === "object") {
+      Object.keys(v).forEach((k) => walk(v[k], depth + 1));
+    }
   };
-  add(d.source_zip);
-  (d.items || []).forEach((it) => {
-    add(it.source_zip);
-    add(it.source && it.source.zip);
-    add(it.zip);
-  });
+  walk(d, 0);
   return out;
 }
 
@@ -213,6 +216,21 @@ async function loadAll() {
  * 10/10; fazenda-clara-bahia matched fernando-carla 58/58). Relabelling those
  * would mis-attribute one farm's photos to another. Require the namespace names
  * to be lexically related AND a high filename match rate. */
+/* Tokens too generic to prove two namespaces are the same place. `fazenda`
+ * appears in a dozen unrelated farms, so treating it as evidence made every
+ * `fazenda-*` namespace a candidate and stalled otherwise-correct matches. */
+const NS_STOP = new Set([
+  "fazenda", "farm", "farms", "para", "paca", "pacaje", "bahia", "plot",
+  "office", "the", "and", "site", "field",
+]);
+const nsTokens = (s) =>
+  new Set(
+    String(s || "")
+      .toLowerCase()
+      .replace(/^farms\//, "")
+      .split(/[-_/. ]+/)
+      .filter((t) => t && t.length > 2 && !NS_STOP.has(t))
+  );
 const nsKey = (s) =>
   String(s || "")
     .toLowerCase()
@@ -246,10 +264,16 @@ function resolveNamespaces() {
     /* 2. Candidates: lexically related, OR proven by the manifest's source zip. */
     const linked = new Set();
     const nk = nsKey(ns);
+    const nt = nsTokens(ns);
     RAW_FILES.forEach((_, c) => {
       if (c === ns) return;
       const ck = nsKey(c);
-      if (ck && nk && (nk.includes(ck) || ck.includes(nk))) linked.add(c);
+      if (ck && nk && (nk.includes(ck) || ck.includes(nk))) return linked.add(c);
+      /* Substring containment misses `rancho-maranta-para` vs
+       * `rancho-maranta-plot-1`/`plot-2`, which share two real tokens but
+       * neither contains the other. Token overlap catches the split. */
+      const ct = nsTokens(c);
+      for (const t of nt) if (ct.has(t)) return linked.add(c);
     });
     (PROVENANCE.get(ns) || new Set()).forEach((z) => {
       const zk = nsKey(z.replace(/\.zip$/i, ""));
