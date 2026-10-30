@@ -9,6 +9,7 @@ const ytThumb = (id) => `https://img.youtube.com/vi/${id}/hqdefault.jpg`;
 const PREVIEWS_INDEX = `${S3}/previews.json`;
 const PREVIEW_STEMS = new Map(); // ns -> Set(stem) of previews that actually exist
 const RAW_FILES = new Map(); // ns -> { filename: ext } straight from S3
+const PROVENANCE = new Map(); // ns -> Set(zip basenames) the manifest says it came from
 
 const TYPE_ORDER = ["farm", "facility", "event", "partner", "program", "unsorted"];
 const ITEMS = [];
@@ -70,6 +71,60 @@ function applyPreview(it) {
     it.file && hasPreview(it.ns, it.stem) ? `${S3}/previews/${it.ns}/${it.stem}.jpg` : null;
   it.rawUrl = it.file && it.isVideo ? `${S3}/raw/${it.ns}/${encodeURIComponent(it.file)}` : null;
   return it;
+}
+
+/* Extensions are not reliable identifiers: the manifest records `IMG_8501.mp4`
+ * while S3 holds `IMG_8501.MOV` \u2014 same clip, different container name and case.
+ * Matching on the exact filename left all 19 fazenda-dona-rosa videos unplayable. */
+const extOf = (f) => {
+  const m = String(f || "").match(/\.([^.]+)$/);
+  return m ? m[1].toUpperCase() : "";
+};
+const stemOf = (f) => String(f || "").replace(/\.[^.]+$/, "");
+const VIDEO_EXTS = new Set(["MP4", "MOV", "M4V", "AVI"]);
+const sameKind = (a, b) => {
+  if (a === b) return true;
+  if (!a || !b) return true; // manifest omitted the extension entirely
+  return VIDEO_EXTS.has(a) && VIDEO_EXTS.has(b);
+};
+
+/* Every zip any item in this manifest claims to have been extracted from.
+ * Provenance outranks name similarity: `fazenda-clara-bahia` records
+ * source.zip=fernando_carla.zip and matches raw/fernando-carla 58/58, yet the
+ * two names share no token \u2014 a lexical-only rule rejects a provable link. */
+function sourceZips(d) {
+  const out = new Set();
+  const walk = (v, depth) => {
+    if (depth > 4 || v == null) return;
+    if (typeof v === "string") {
+      const m = v.match(/([^\/\\]+\.zip)\b/i);
+      if (m) out.add(m[1]);
+      return;
+    }
+    if (Array.isArray(v)) return v.slice(0, 40).forEach((x) => walk(x, depth + 1));
+    if (typeof v === "object") {
+      Object.keys(v).forEach((k) => walk(v[k], depth + 1));
+    }
+  };
+  walk(d, 0);
+  return out;
+}
+
+/* Resolve one manifest filename against one namespace's real S3 keys. */
+function matchIn(ns, file) {
+  const s3 = RAW_FILES.get(ns);
+  if (!s3) return null;
+  if (file in s3) return { ns, file };
+  const st = stemOf(file);
+  const e = extOf(file);
+  const cands = Object.keys(s3).filter((k) => stemOf(k) === st);
+  if (!cands.length) return null;
+  const kind = cands.filter((k) => sameKind(extOf(k), e));
+  if (kind.length === 1) return { ns, file: kind[0] };
+  const exact = kind.filter((k) => extOf(k) === e);
+  if (exact.length === 1) return { ns, file: exact[0] };
+  if (!e && cands.length === 1) return { ns, file: cands[0] };
+  return null;
 }
 
 function normalize(it, ns, id) {
@@ -136,6 +191,8 @@ async function loadAll() {
         if (!r.ok) return;
         const d = await r.json();
         const ns = f.replace(/\.json$/, "");
+        const zips = sourceZips(d);
+        if (zips.size) PROVENANCE.set(ns, zips);
         (d.items || []).forEach((it) => ITEMS.push(normalize(it, ns, ITEMS.length)));
       } catch (e) {
         console.warn("manifest failed:", f, e);
@@ -159,6 +216,21 @@ async function loadAll() {
  * 10/10; fazenda-clara-bahia matched fernando-carla 58/58). Relabelling those
  * would mis-attribute one farm's photos to another. Require the namespace names
  * to be lexically related AND a high filename match rate. */
+/* Tokens too generic to prove two namespaces are the same place. `fazenda`
+ * appears in a dozen unrelated farms, so treating it as evidence made every
+ * `fazenda-*` namespace a candidate and stalled otherwise-correct matches. */
+const NS_STOP = new Set([
+  "fazenda", "farm", "farms", "para", "paca", "pacaje", "bahia", "plot",
+  "office", "the", "and", "site", "field",
+]);
+const nsTokens = (s) =>
+  new Set(
+    String(s || "")
+      .toLowerCase()
+      .replace(/^farms\//, "")
+      .split(/[-_/. ]+/)
+      .filter((t) => t && t.length > 2 && !NS_STOP.has(t))
+  );
 const nsKey = (s) =>
   String(s || "")
     .toLowerCase()
@@ -168,33 +240,72 @@ function resolveNamespaces() {
   if (!RAW_FILES.size) return;
   const byNs = new Map();
   ITEMS.forEach((it) => {
-    if (!byNs.has(it.ns)) byNs.set(it.ns, new Set());
-    byNs.get(it.ns).add(it.file);
+    if (!byNs.has(it.ns)) byNs.set(it.ns, []);
+    byNs.get(it.ns).push(it);
   });
-  byNs.forEach((files, ns) => {
-    if (RAW_FILES.has(ns)) return;
-    const nk = nsKey(ns);
-    if (!nk) return;
-    let best = null;
-    RAW_FILES.forEach((s3files, cand) => {
-      const ck = nsKey(cand);
-      if (!ck || !(nk.includes(ck) || ck.includes(nk))) return;
-      let hits = 0;
-      files.forEach((f) => {
-        if (f in s3files) hits++;
-      });
-      if (hits && (!best || hits > best.hits)) best = { cand, hits };
+  const adopt = (it, m) => {
+    it.ns = m.ns;
+    it.file = m.file;
+    it.stem = stemOf(m.file);
+    it.isVideo = VIDEO_EXTS.has(extOf(m.file));
+  };
+  let moved = 0;
+  byNs.forEach((items, ns) => {
+    /* 1. Same namespace, tolerant of extension case and video container naming. */
+    const unresolved = [];
+    items.forEach((it) => {
+      const m = matchIn(ns, it.file);
+      if (m) {
+        if (m.file !== it.file) adopt(it, m);
+      } else unresolved.push(it);
     });
-    if (best && best.hits / files.size >= 0.75) {
-      ITEMS.forEach((it) => {
-        if (it.ns === ns) it.ns = best.cand;
+    if (!unresolved.length) return;
+
+    /* 2. Candidates: lexically related, OR proven by the manifest's source zip. */
+    const linked = new Set();
+    const nk = nsKey(ns);
+    const nt = nsTokens(ns);
+    RAW_FILES.forEach((_, c) => {
+      if (c === ns) return;
+      const ck = nsKey(c);
+      if (ck && nk && (nk.includes(ck) || ck.includes(nk))) return linked.add(c);
+      /* Substring containment misses `rancho-maranta-para` vs
+       * `rancho-maranta-plot-1`/`plot-2`, which share two real tokens but
+       * neither contains the other. Token overlap catches the split. */
+      const ct = nsTokens(c);
+      for (const t of nt) if (ct.has(t)) return linked.add(c);
+    });
+    (PROVENANCE.get(ns) || new Set()).forEach((z) => {
+      const zk = nsKey(z.replace(/\.zip$/i, ""));
+      if (!zk) return;
+      RAW_FILES.forEach((_, c) => {
+        if (nsKey(c) === zk) linked.add(c);
       });
-      console.info(`namespace aliased: ${ns} -> ${best.cand} (${best.hits}/${files.size} files match)`);
-    } else {
-      console.info(`namespace kept unaliased (not lexically related): ${ns}`);
+    });
+    if (!linked.size) {
+      console.info(`unlinked: ${ns} (${unresolved.length}) \u2014 no related or provenance-linked namespace`);
+      return;
     }
+
+    /* 3. Per ITEM, and only when exactly one namespace can serve it. A stem like
+     * IMG_7833 exists in several namespaces, so a namespace-wide relabel would
+     * silently mis-attribute one farm's photos to another. */
+    unresolved.forEach((it) => {
+      const hits = [];
+      linked.forEach((c) => {
+        const m = matchIn(c, it.file);
+        if (m) hits.push(m);
+      });
+      if (hits.length === 1) {
+        adopt(it, hits[0]);
+        moved++;
+      } else if (hits.length > 1) {
+        console.info(`ambiguous, left unlinked: ${ns}/${it.file}`);
+      }
+    });
   });
   ITEMS.forEach(applyPreview);
+  if (moved) console.info(`resolved ${moved} manifest row(s) into a real S3 namespace`);
 }
 
 /* Drop manifest rows whose file does not exist in S3 at all: they can never render,
